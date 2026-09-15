@@ -30,13 +30,48 @@ const openai = new OpenAI({
   }
 });
 
-// موديلات مجانية مع fallback
-const FREE_MODELS = [
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "google/gemini-2.0-flash-exp:free",
-  "deepseek/deepseek-chat-v3-0324:free",
-  "qwen/qwen-2.5-72b-instruct:free"
-];
+// ====== جلب الموديلات المجانية تلقائياً ======
+let freeModelsCache = [];
+let lastFetch = 0;
+const CACHE_DURATION = 1000 * 60 * 60; // ساعة
+
+async function getFreeModels() {
+  // لو الكاش لسه صالح
+  if (freeModelsCache.length && Date.now() - lastFetch < CACHE_DURATION) {
+    return freeModelsCache;
+  }
+
+  try {
+    console.log('🔄 Fetching free models from OpenRouter...');
+    const res = await fetch('https://openrouter.ai/api/v1/models');
+    const data = await res.json();
+
+    // فلترة الموديلات المجانية (سعر 0)
+    const free = data.data
+      .filter(m => {
+        const p = m.pricing || {};
+        return parseFloat(p.prompt || '1') === 0 
+            && parseFloat(p.completion || '1') === 0;
+      })
+      .map(m => m.id)
+      .filter(id => id.includes(':free')) // عشان نضمن
+      .slice(0, 10); // أول 10
+
+    if (free.length) {
+      freeModelsCache = free;
+      lastFetch = Date.now();
+      console.log(`✅ Found ${free.length} free models:`, free.slice(0, 3).join(', '), '...');
+    }
+
+    return freeModelsCache;
+  } catch (err) {
+    console.error('❌ Failed to fetch models:', err.message);
+    // fallback لقائمة ثابتة
+    return freeModelsCache.length ? freeModelsCache : [
+      "meta-llama/llama-3.1-8b-instruct:free"
+    ];
+  }
+}
 
 // System Prompt
 const systemPrompt = `أنت مساعد خدمة عملاء ذكي لشركة "${COMPANY_CONFIG.name}".
@@ -50,23 +85,27 @@ const systemPrompt = `أنت مساعد خدمة عملاء ذكي لشركة "$
 - كن مفيداً ومحترماً
 - لا تخرج عن موضوع خدمات الشركة`;
 
-// دالة استدعاء AI مع fallback
+// دالة استدعاء AI مع fallback ذكي
 async function callAI(messages) {
   const preferred = process.env.MODEL;
+  const autoModels = await getFreeModels();
+
+  // ترتيب: الموديل المفضل أولاً، ثم الباقي
   const models = preferred 
-    ? [preferred, ...FREE_MODELS.filter(m => m !== preferred)]
-    : FREE_MODELS;
+    ? [preferred, ...autoModels.filter(m => m !== preferred)]
+    : autoModels;
 
   let lastError;
   for (const model of models) {
     try {
+      console.log(`🤖 Trying: ${model}`);
       const completion = await openai.chat.completions.create({
         model,
         messages,
         temperature: 0.7,
         max_tokens: 500
       });
-      console.log(`✅ Used model: ${model}`);
+      console.log(`✅ Success with: ${model}`);
       return completion.choices[0]?.message?.content;
     } catch (err) {
       console.warn(`⚠️ ${model} failed: ${err.message}`);
@@ -93,7 +132,6 @@ app.post('/api/chat', async (req, res) => {
 
     const reply = await callAI(messages);
 
-    // حفظ في Supabase (async - مش بنستنى عشان الرد يبقى سريع)
     if (sessionId) {
       db.saveMessage(sessionId, message, reply)
         .catch(e => console.error('DB save error:', e.message));
@@ -103,11 +141,24 @@ app.post('/api/chat', async (req, res) => {
 
   } catch (error) {
     console.error('Chat error:', error.message);
-    res.status(500).json({ error: 'حدث خطأ في المعالجة' });
+    res.status(500).json({ 
+      error: 'حدث خطأ في المعالجة',
+      details: error.message 
+    });
   }
 });
 
-// ====== Admin Endpoints ======
+// ====== Endpoint لمعاينة الموديلات المتاحة ======
+app.get('/api/models', async (req, res) => {
+  const models = await getFreeModels();
+  res.json({ 
+    count: models.length, 
+    models,
+    cached_at: new Date(lastFetch).toISOString()
+  });
+});
+
+// ====== Admin ======
 app.get('/api/admin/stats', async (req, res) => {
   const password = req.headers['x-admin-password'];
   if (password !== process.env.ADMIN_PASSWORD) {
@@ -120,7 +171,6 @@ app.get('/api/admin/stats', async (req, res) => {
       topQuestions: await db.getTopQuestions(10)
     });
   } catch (e) {
-    console.error('Admin error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -138,17 +188,19 @@ app.delete('/api/admin/clear', async (req, res) => {
   }
 });
 
-// ====== Health Check ======
-app.get('/health', (req, res) => {
+// ====== Health ======
+app.get('/health', async (req, res) => {
+  const models = await getFreeModels();
   res.json({ 
     status: 'ok', 
     company: COMPANY_CONFIG.name, 
     provider: 'OpenRouter',
-    database: 'Supabase'
+    database: 'Supabase',
+    free_models_count: models.length
   });
 });
 
-// ====== Widget JS ======
+// ====== Widget ======
 app.get('/widget.js', (req, res) => {
   res.type('application/javascript');
   res.send(`
@@ -177,6 +229,8 @@ app.get('/widget.js', (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`🏢 Company: ${COMPANY_CONFIG.name}`);
-  console.log(`🆓 AI: OpenRouter (Free)`);
+  console.log(`🆓 AI: OpenRouter (Auto free models)`);
   console.log(`💾 DB: Supabase`);
+  // جلب الموديلات عند البدء
+  getFreeModels();
 });
